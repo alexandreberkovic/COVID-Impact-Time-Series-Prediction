@@ -61,9 +61,9 @@ data_sorted <- data[order(data$date),]
 data_sorted$date[950]
 
 #Select all relevant variables
-data_pre <- data_sorted[c("date", "deaths_covid", "hospital_onset_covid")]
+data_pre <- data_sorted[, c(1,26,2:25)]
 
-colnames(data_sorted)
+ncol(data_pre)
 
 #Create data frame to hold normalized variables (except data which isn't normalized)
 data_normed = data_pre
@@ -95,6 +95,8 @@ for(i in 1:ncol(data_shifted)) {       # for-loop over columns
 
 #Select only date and deaths to make the time series 
 deaths_df  <- data_shifted[c("date", "deaths_covid")]
+
+colnames(data_pre[,2:26])
 ```
 ```{r}
 #Create tibble for data
@@ -160,9 +162,9 @@ plot_hospital_onset
   
 ```
 ```{r}
-NC_Tsib$date[1037]
-
-
+#Time Delay Embedding
+lag_order <- 14 # the desired number of lags (14 days)
+horizon <- 7 # the forecasting horizon (7 days)
 
 #Pretend we are on 10/25/2022 and want to predict the next week  10/26/2022(until the end of our data set) 11/2/22
 length(Ts) == 950 * (ncol(Tsib) - 1)  #1900, there are 950 days in the entire data set 2020-03-28 to 2022-11-02 with no missed dates (index 1 to 950, 950 days)
@@ -192,9 +194,6 @@ plot.ts(Ts_trf)
 ```
 
 ```{r}
-#Time Delay Embedding
-lag_order <- 14 # the desired number of lags (14 days)
-horizon <- 7 # the forecasting horizon (7 days)
 
 Ts_mbd <- embed(Ts_trf, lag_order + 1)
 
@@ -207,7 +206,8 @@ nrow(Ts_mbd) == (950 - horizon) - lag_order #922 -> 943 days between 3/28/2020 a
 #Create train and test sets
 y_train <- Ts_mbd[, 1] #column ,1 (deaths data) to predict based on the lags (death and other variables)
                           #and data from the other variables
-X_train <- Ts_mbd[, -1:-2] #the lags (death and other variables) and data from the other variables
+X_train <- Ts_mbd[, -1:-(ncol(data_pre)-1)] #the lags (death and other variables) and data from the other variables
+
 
 
 #y_train is that day's deaths which we predict based on the lags
@@ -219,7 +219,7 @@ length(y_train) == (950 - horizon) - lag_order #929 -> 943 days between 3/28/202
 
 #7 days ahead
 y_test <- window(Deaths_ts, start=2022.818 + .001, end=2022.95)
-X_test <- Ts_mbd[nrow(Ts_mbd), c((ncol(Tsib)):(2*(lag_order+1)))] #this creates lags to use to predict the actual value of Y
+X_test <- Ts_mbd[nrow(Ts_mbd), c((ncol(Tsib)):((ncol(data_pre)-1)*(lag_order+1)))] #this creates lags to use to predict the actual value of Y
 
 X_test
 
