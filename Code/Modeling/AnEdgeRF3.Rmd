@@ -1,0 +1,413 @@
+---
+title: "AnEdge RF"
+author: "Max Petruzzi"
+date: "2022-11-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(Metrics)
+library(randomForest)
+library(tibble)
+library(tsibble)
+library(forecast)
+library(urca)
+library(tidyverse)
+library(lubridate)
+library(MASS)
+
+library(caret)
+library(readr)
+library(magrittr)
+library(ggcorrplot)
+library(splines)
+library(glmnet)
+library(lars)
+library(leaps)
+library(gbm)
+library(reshape2)
+library(rootSolve)
+
+detach(package:plyr)
+
+```
+```{r}
+data = read.csv("covid_clean_imputted_aggregated_vif.csv")
+```
+
+
+```{r}
+colnames(data)
+
+data$deaths_covid
+```
+
+
+```{r}
+#Sort by date
+data_sorted <- data[order(data$date),]
+
+#Data set goes from 2020-03-28 to 2022-11-02 with no missed dates (index 1 to 950, 950 days)
+data_sorted$date[950]
+
+#Select all relevant variables
+data_pre <- data_sorted[, c(1,26,2:25)]
+
+ncol(data_pre)
+
+#Create data frame to hold normalized variables (except data which isn't normalized)
+data_normed = data_pre
+
+#Normalize variables (Start at two so we don't include date)
+for(i in 2:ncol(data_pre)) {       # for-loop over columns
+  data_normed[ , i] <- (data_pre[ , i] - mean(data_pre[ , i])) / sd(data_pre[ , i])
+}
+
+#Create data frame to hold shifted (also normalized) data
+#Now that it is normalized, some values will be negative, so that will mess up the log function
+#Add the minimum value to each column plus some epsilon
+
+data_shifted = data_normed
+
+for(i in 2:ncol(data_normed)) {       # for-loop over columns
+  data_shifted[ , i] <- data_normed[ , i] - min(data_normed[ , i]) + 0.001
+}
+
+#Confirm that the minimums are now equal to zero
+for(i in 2:ncol(data_shifted)) {  
+  print(min(data_shifted[ , i]) == 0.001)
+}
+
+#Make sure nothing is N/A
+for(i in 1:ncol(data_shifted)) {       # for-loop over columns
+  print(sum(is.na(data_shifted[,i]))==0)
+}
+
+#Select only date and deaths to make the time series 
+deaths_df  <- data_shifted[c("date", "deaths_covid")]
+
+colnames(data_pre[,2:26])
+```
+```{r}
+#Create tibble for data
+Tib = as_tibble(data_shifted)
+Deaths_tib = as_tibble(deaths_df)
+
+#Make dates "Date" type (double) instead of character
+Tib$date = as.Date(ymd(Tib$date))
+Deaths_tib$date = as.Date(ymd(Deaths_tib$date))
+
+#Create tsibble for data
+Tsib = as_tsibble(Tib, index = date)
+Deaths_Tsib = as_tsibble(Deaths_tib, index = date)
+
+#Since the min of deaths is zero, this adds 1 in order to prevent log(0) = -inf
+#No longer needed because we normalized
+
+#NC_Tib$deaths_covid <- NC_Tib$deaths_covid - (min(NC_Tib$deaths_covid - 1))
+#NC_Deaths_tib$deaths_covid = NC_Deaths_tib$deaths_covid - (min(NC_Deaths_tib$deaths_covid - 1))
+
+#Convert to ts format
+Ts <- as.ts(Tsib, data = Tsib, frequency=365.25)
+Deaths_ts <- as.ts(Deaths_Tsib, data = Deaths_Tsib, frequency=365.25)
+
+#Confirmations (All should return TRUE)
+
+is.ts(Ts) == TRUE
+is.ts(Deaths_ts) == TRUE
+
+#Dates are doubles
+typeof(Ts[,1]) == "double"
+typeof(Deaths_ts) == "double"
+
+#Confirm no gaps 
+has_gaps(Tsib) == FALSE
+has_gaps(Deaths_Tsib) == FALSE
+
+#Confirm no explicit missings
+colSums(is.na(Tsib[,"deaths_covid"])) == 0
+colSums(is.na(Deaths_Tsib[,"deaths_covid"])) == 0 
+```
+
+```{r}
+#visualize
+plot <- Tsib %>% ggplot(aes(date, deaths_covid)) +
+  geom_line() +
+  ggtitle("Covid Deaths Over Time From Reporting Hospitals") + 
+  labs(x="Date", y="Deaths (Normalized and Shifted)") +
+  theme_minimal() 
+  
+plot
+```
+
+
+```{r}
+plot_hospital_onset <- Tsib %>% ggplot(aes(date, hospital_onset_covid)) +
+  geom_line() + 
+  labs(title="Hospital Covid Onset Over Time From Reporting Hospitals", x="Date", y="Hospital
+  Onset Covid (Normalized and Shifted)") +
+  theme_minimal() 
+
+plot_hospital_onset
+  
+```
+```{r}
+#Time Delay Embedding
+lag_order <- 7 # the desired number of lags (14 days)
+horizon <- 7 # the forecasting horizon (7 days)
+
+#Pretend we are on 10/25/2022 and want to predict the next week  10/26/2022(until the end of our data set) 11/2/22
+length(Ts) == 950 * (ncol(Tsib) - 1)  #1900, there are 950 days in the entire data set 2020-03-28 to 2022-11-02 with no missed dates (index 1 to 950, 950 days)
+#It'll be twice 950 (1900) because there are two data columns
+
+#Trial and error until length of Ts_org is 1900-2(7) = 1886  = (943 * 2)
+Ts_org <- window(Ts, end=2022.818)
+Deaths_org <- window(Deaths_ts, end=2022.818)
+
+#Confirmation that Ts_org is the correct length to predict last 1 week of data set 
+length(Ts_org) == (ncol(Tsib) - 1) * (950 - horizon)
+length(Deaths_org) == (ncol(Deaths_Tsib) - 1) * (950 - horizon)
+
+#Estimate the required order of differencing
+#n_diffs <- nsdiffs(Ts_org)
+
+dim(Ts_org)
+
+#Stabilize variance with log
+Ts_trf <- Ts_org %>% log() 
+
+#Check if KPSS is significant (meaning that we need to stabilize mean)
+Ts_trf[,1] %>% ur.kpss() %>% summary()
+
+#KPSS for log-adjusted was significant so it should be stabilized
+#The data is stabilized because it is cyclic, not seasonal
+#This means there are repeating cycles, but it is not a fixed period that can be corrected by periodically stabilizing the mean
+plot.ts(Ts_trf)
+```
+
+```{r}
+
+Ts_mbd <- embed(Ts_trf, lag_order + 1)
+
+#Confirmations
+ncol(Ts_mbd) == (ncol(Tsib) - 1) * (lag_order+1) #30, the 2 data columns and the 14 lags per data column
+nrow(Ts_mbd) == (950 - horizon) - lag_order #922 -> 943 days between 3/28/2020 and including 10/26/2022, this is correct - lose 14 days because that is our lag_order
+```
+
+```{r}
+#Create train and test sets
+y_train <- Ts_mbd[, 1] #column ,1 (deaths data) to predict based on the lags (death and other variables)
+                          #and data from the other variables
+X_train <- Ts_mbd[, -1] #the lags (death and other variables) and data from the other variables
+
+ncol(X_train)
+
+#y_train is that day's deaths which we predict based on the lags
+#X_train is the lags of deaths and lags of hospital_onset_covid
+#We don't include the second column (current values of hospital_onset_covid) to either X_train or y_train
+length(X_train) == ((950 - horizon) - lag_order) * (((ncol(Tsib)-1) * (lag_order+1))-1)
+
+length(y_train) == (950 - horizon) - lag_order #929 -> 943 days between 3/28/2020 and including 10/26/2022, this is correct - lose 14 days because that is our lag_order
+
+#7 days ahead
+y_test <- window(Deaths_ts, start=2022.818 + .001, end=2022.95)
+X_test <- Ts_mbd[nrow(Ts_mbd), -1] #this creates lags to use to predict the actual value of Y
+
+#Confirmations
+length(y_test) == horizon 
+length(X_test) == (((ncol(Tsib)-1) * (lag_order+1))-1) #30
+
+```
+
+```{r}
+ncol(X_train)
+
+#Implement Random Forest
+forecasts_rf = numeric(horizon)
+
+#i_scores = list()
+
+for (i in 1:horizon) {
+  #setting seed
+  set.seed(1)
+  
+  #fitting model
+  fit_rf <- randomForest(X_train, y_train)
+  
+  #predict using the test set
+  forecasts_rf[i] <- predict(fit_rf, X_test)
+  
+  #feature importance - conditional true adjusts for correlations between features
+  #print(varImp(fit_rf, conditional=TRUE))
+  
+  #reshaping the training data to reflect the time distance corresponding to the current forecast horizon
+  y_train <- y_train[-1] #remove item 1 (horizontal vector, shifts everything right)
+  X_train <- X_train[-nrow(X_train), ] #remove the last row (shifts everything down)
+}
+
+
+  #setting seed
+  set.seed(1)
+  
+  #fitting model
+  fit_rf <- randomForest(X_train, y_train)
+  
+  #predict using the test set
+  forecasts_rf[1] <- predict(fit_rf, X_test)
+  
+  #feature importance - conditional true adjusts for correlations between features
+  i_scores <- varImp(fit_rf, conditional=TRUE)
+  i_scores <- i_scores %>% tibble::rownames_to_column("var") 
+  i_scores
+  
+  #Separating the scores into different features
+  i_scores <- i_scores %>% add_column(Feature=c(2:25,1:25,1:25,1:25,1:25,1:25,1:25,1:25,1:25,1:25,
+                                    1:25,1:25,1:25,1:25,1:25))
+  
+  i_scores %>% group_by(Feature)
+  
+  features <- i_scores %>% group_by(Feature)
+  
+  features = i_scores %>% group_by(Feature) %>%
+                    summarise(Overall = mean(Overall),
+                              .groups = 'drop')
+  
+  #Adding the names of the features
+  
+  
+  features <- features %>% add_column(feature_name=colnames(data_shifted[2:ncol(data_shifted)]))
+  features
+  
+  features %>% arrange(desc(Overall))
+  
+  
+
+
+  
+  i_scores$var<- i_scores$var %>% as.factor()
+  
+  #reshaping the training data to reflect the time distance corresponding to the current forecast horizon
+  #y_train <- y_train[-1] #remove item 1 (horizontal vector, shifts everything right)
+  #X_train <- X_train[-nrow(X_train), ] #remove the last ("top") row (shifts everything down - bottom of the data frame is the most recent to prediction start- so when 
+  
+  i_scores
+  
+  i_bar <- ggplot(data = i_scores) + 
+  geom_bar(
+    stat = "identity",#it leaves the data without count and bin
+    mapping = aes(x = var, y=Overall, fill = var), 
+    show.legend = FALSE,
+    width = 1
+  ) + 
+  labs(x = NULL, y = NULL)
+i_bar + coord_polar() + theme_minimal()
+i_bar + coord_flip() + theme_minimal()
+
+
+nrow(X_train) #922 (ran 7 times for the horizon)
+length(y_train) #922 (ran 7 times for the horizon)
+```
+
+
+```{r}
+length(forecasts_rf) #7
+
+forecasts_rf
+
+# undoing the log we took earlier
+exp_term <- exp((forecasts_rf))
+#length(exp_term) #14
+
+#Don't need to do all this undoingnormalization because the values on the graph are normalized too
+
+#(data_pre[ , i] - mean(data_pre[ , i])) / sd(data_pre[ , i])
+
+#(exp_term * sd(data_pre$deaths_covid))
+
+#mean(data_pre$deaths_covid)
+
+#min(data_normed$deaths_covid)
+
+#exp_term <- (exp_term * sd(data_pre$deaths_covid)) + mean(data_pre$deaths_covid) - min(data_normed$deaths_covid) - 0.001
+
+exp_term
+
+#Adding the transformation that we did to normalize and scale deaths 
+
+# extracting the last observation from the time series, right before we start predicting (meaning 12/31/21) (y_t)
+#last_observation <- as.vector(tail(NC_ts_org, 1))
+#last_observation
+
+# calculate the final predictions
+#backtransformed_forecasts <- last_observation * exp_term
+#length(backtransformed_forecasts) #14
+
+# convert to ts format
+y_pred <- ts(
+  exp_term,
+  start = 2022.818 + .001,
+  frequency = 365.25
+)
+
+length(y_pred) #7
+
+# adding the forecasts to the deaths tibble
+Deaths_Tsib <- Deaths_Tsib %>% 
+  mutate(Forecast = c(rep(NA, length(Deaths_org)), y_pred))
+
+#Changing bounds of the graph so it is zoomed in
+Tsib_subset <- subset(Deaths_Tsib, date > "2022-10-01")
+
+# visualize the forecasts
+plot_fc <- Tsib_subset %>% 
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = deaths_covid)) +
+  geom_line(aes(y = Forecast), color = "blue") +
+  theme_minimal() +
+  labs(
+    title = "Next Week Forecast of COVID-19 deaths",
+    x = "Year",
+    y = "Deaths"
+  )
+
+plot_fc
+
+y_pred_sub = y_pred[1:306]
+
+accuracy(y_pred, y_test)
+y_pred
+#732.5447 749.2053 775.9662 700.8789 705.9567 726.0170 712.8310 683.9652 671.0534 674.5169 638.6950 644.6855 639.2282 689.2556
+y_test
+#31 31 33 34 36 41 29 40 26 36 46 50 42 45
+```
+```{r}
+#Feature importance
+
+#Conditional=True, adjusts for correlations between predictors.
+length(i_scores)
+#Gathering rownames in 'var'  and converting it to the factor
+#to provide 'fill' parameter for the bar chart. 
+i_scores <- i_scores %>% tibble::rownames_to_column("var") 
+i_scores$var<- i_scores$var %>% as.factor()
+#Plotting the bar and polar charts for comparing variables
+i_bar <- ggplot(data = i_scores) + 
+  geom_bar(
+    stat = "identity",#it leaves the data without count and bin
+    mapping = aes(x = var, y=Overall, fill = var), 
+    show.legend = FALSE,
+    width = 1
+  ) + 
+  labs(x = NULL, y = NULL)
+i_bar + coord_polar() + theme_minimal()
+i_bar + coord_flip() + theme_minimal()
+```
+
